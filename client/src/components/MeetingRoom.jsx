@@ -60,6 +60,7 @@ function MeetingRoom() {
   const [isReviewing, setIsReviewing] = useState(false);
   const [reviewResult, setReviewResult] = useState(null);
   const [ingestError, setIngestError] = useState('');
+  const [mvpLevel, setMvpLevel] = useState('medium');
 
   // Cumulative data refs
   const chatMessagesRef = useRef('');
@@ -280,151 +281,95 @@ function MeetingRoom() {
     joinMeeting();
   }, [joinMeeting]);
 
-  // ── Audio helpers for transcription ─────────────────────
-  const downsampleBuffer = useCallback((buffer, sampleRate, outSampleRate) => {
-    if (outSampleRate === sampleRate) return buffer;
-    const ratio = sampleRate / outSampleRate;
-    const newLength = Math.round(buffer.length / ratio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetBuffer = 0;
-    while (offsetResult < result.length) {
-      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-      let accum = 0, count = 0;
-      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-        accum += buffer[i];
-        count++;
-      }
-      result[offsetResult] = accum / count;
-      offsetResult++;
-      offsetBuffer = nextOffsetBuffer;
-    }
-    return result;
-  }, []);
+  // Track active media sources to prevent duplicate connections and memory leaks
+  const activeSourcesRef = useRef(new Map());
 
-  const convertFloat32ToInt16 = useCallback((buffer) => {
-    const buf = new Int16Array(buffer.length);
-    for (let i = 0; i < buffer.length; i++) {
-      buf[i] = Math.min(1, Math.max(-1, buffer[i])) * 0x7fff;
-    }
-    return buf.buffer;
-  }, []);
+  // ── Browser-Native Transcription ───────────────────────
+  const shouldTranscribeRef = useRef(false);
 
-  // ── Gemini-Powered Transcription ───────────────────────
-  const startTranscription = useCallback(async () => {
+  const startTranscription = useCallback(() => {
     setIsTranscribing(true);
     setConnectionError('');
+    shouldTranscribeRef.current = true;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setConnectionError('Speech Recognition is not supported in this browser.');
+      setIsTranscribing(false);
+      shouldTranscribeRef.current = false;
+      return;
+    }
 
     try {
-      // 1. Set up AudioContext with worklet
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      transcriptCtxRef.current = ctx;
-      await ctx.audioWorklet.addModule('/pcm-processor.js');
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false; // Setting this to false avoids many "network" socket timeouts
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
 
-      // 2. Connect WebSocket to transcription endpoint
-      const wsProtocol = SERVER_URL.startsWith('https') ? 'wss' : 'ws';
-      const wsHost = SERVER_URL.replace(/^https?:\/\//, '');
-      const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/transcribe`);
-      ws.binaryType = 'arraybuffer';
-      transcriptWsRef.current = ws;
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'transcript' && msg.text) {
-            const line = `Speaker: ${msg.text}`;
-            transcriptRef.current += line + '\n';
-            setTranscript(transcriptRef.current);
-          } else if (msg.type === 'error') {
-            console.error('Transcription error:', msg.text);
-            setConnectionError('Transcription error: ' + msg.text);
-          }
-        } catch { }
+      recognition.onstart = () => {
+        console.log('📝 Transcription started via SpeechRecognition API');
+        setConnectionError('');
       };
 
-      ws.onclose = () => {
-        console.log('Transcription WebSocket closed');
-      };
+      recognition.onresult = (event) => {
+        const current = event.resultIndex;
+        const transcript = event.results[current][0].transcript;
 
-      ws.onerror = () => {
-        setConnectionError('Failed to connect to transcription service');
-        setIsTranscribing(false);
-      };
-
-      // 3. Wait for WS to open
-      await new Promise((resolve, reject) => {
-        ws.onopen = () => resolve();
-        ws.onerror = () => reject(new Error('Transcription WebSocket failed'));
-        setTimeout(() => reject(new Error('Transcription connection timeout')), 10000);
-      });
-
-      // 4. Get audio stream — reuse Agora track or fallback to getUserMedia
-      let stream;
-      let ownsStream = false;
-
-      if (localAudioTrack) {
-        const rawTrack = localAudioTrack.getMediaStreamTrack
-          ? localAudioTrack.getMediaStreamTrack()
-          : null;
-        if (rawTrack) {
-          stream = new MediaStream([rawTrack]);
-          console.log('📝 Transcription: reusing Agora mic track');
-        }
-      }
-
-      if (!stream) {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        ownsStream = true;
-        console.log('📝 Transcription: using dedicated mic stream');
-      }
-
-      transcriptStreamRef.current = ownsStream ? stream : null;
-
-      // 5. Connect AudioWorklet to capture + send PCM
-      const source = ctx.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
-      transcriptWorkletRef.current = workletNode;
-
-      workletNode.port.onmessage = (event) => {
-        if (transcriptWsRef.current?.readyState === WebSocket.OPEN) {
-          const downsampled = downsampleBuffer(event.data, ctx.sampleRate, 16000);
-          const pcm16 = convertFloat32ToInt16(downsampled);
-          transcriptWsRef.current.send(pcm16);
+        if (transcript.trim()) {
+          const line = `Speaker: ${transcript}`;
+          transcriptRef.current += line + '\n';
+          setTranscript(transcriptRef.current);
         }
       };
 
-      source.connect(workletNode);
-      const muteGain = ctx.createGain();
-      muteGain.gain.value = 0;
-      workletNode.connect(muteGain);
-      muteGain.connect(ctx.destination);
+      recognition.onerror = (event) => {
+        console.error('Transcription error:', event.error);
+        if (event.error !== 'no-speech' && event.error !== 'network') {
+          setConnectionError('Transcription error: ' + event.error);
+        } else if (event.error === 'network') {
+          console.warn('Network timeout from Speech API. Restarting fresh...');
+        }
+      };
 
-      console.log('📝 Transcription started');
+      recognition.onend = () => {
+        // Automatically restart if it stops while we still want to be transcribing
+        // Instead of trying to restart a dead object, we call startTranscription fresh
+        if (shouldTranscribeRef.current) {
+          setTimeout(() => {
+            startTranscription();
+          }, 400); // Slight delay to prevent aggressive bouncing
+        } else {
+          console.log('Transcription stopped');
+        }
+      };
+
+      recognition.start();
+
+      // Store it in a ref so we can stop it later
+      transcriptWsRef.current = recognition; // Reusing this ref name so stopTranscription still works
+
     } catch (err) {
       console.error('Transcription start failed:', err);
       setConnectionError('Failed to start transcription: ' + err.message);
       setIsTranscribing(false);
+      shouldTranscribeRef.current = false;
     }
-  }, [localAudioTrack, downsampleBuffer, convertFloat32ToInt16]);
+  }, []);
 
   const stopTranscription = useCallback(() => {
-    if (transcriptWorkletRef.current) {
-      transcriptWorkletRef.current.disconnect();
-      transcriptWorkletRef.current = null;
-    }
-    if (transcriptStreamRef.current) {
-      transcriptStreamRef.current.getTracks().forEach((t) => t.stop());
-      transcriptStreamRef.current = null;
-    }
+    setIsTranscribing(false);
+    shouldTranscribeRef.current = false;
+
     if (transcriptWsRef.current) {
-      transcriptWsRef.current.close();
+      transcriptWsRef.current.stop();
       transcriptWsRef.current = null;
     }
+
     if (transcriptCtxRef.current) {
       transcriptCtxRef.current.close().catch(() => { });
       transcriptCtxRef.current = null;
     }
-    setIsTranscribing(false);
   }, []);
 
   // ── Toggle controls ───────────────────────────────────
@@ -915,6 +860,43 @@ function MeetingRoom() {
                   </div>
 
                   <div className="review-section">
+                    <label className="review-label" style={{ marginBottom: '8px', display: 'block', fontWeight: 'bold' }}>MVP Level</label>
+                    <div className="mvp-level-selector" style={{ display: 'flex', gap: '15px', marginBottom: '15px' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="mvpLevel"
+                          value="full"
+                          checked={mvpLevel === 'full'}
+                          onChange={(e) => setMvpLevel(e.target.value)}
+                          disabled={isReviewing}
+                        />
+                        Full Fledged
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="mvpLevel"
+                          value="medium"
+                          checked={mvpLevel === 'medium'}
+                          onChange={(e) => setMvpLevel(e.target.value)}
+                          disabled={isReviewing}
+                        />
+                        Medium
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="mvpLevel"
+                          value="low"
+                          checked={mvpLevel === 'low'}
+                          onChange={(e) => setMvpLevel(e.target.value)}
+                          disabled={isReviewing}
+                        />
+                        Low
+                      </label>
+                    </div>
+
                     <label className="review-label">Review Feedback</label>
                     <textarea
                       className="review-textarea"
