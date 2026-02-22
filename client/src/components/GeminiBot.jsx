@@ -6,7 +6,7 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
  * GeminiBot — AI meeting assistant component
  * Captures mic audio → sends PCM to backend WebSocket → receives audio + transcriptions
  */
-function GeminiBot({ isActive, onTranscript }) {
+function GeminiBot({ isActive, agoraAudioTrack, onTranscript }) {
   const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | error
   const [error, setError] = useState('');
   const [botTranscripts, setBotTranscripts] = useState([]);
@@ -88,7 +88,7 @@ function GeminiBot({ isActive, onTranscript }) {
 
   const stopAudioPlayback = useCallback(() => {
     scheduledSourcesRef.current.forEach((s) => {
-      try { s.stop(); } catch {}
+      try { s.stop(); } catch { }
     });
     scheduledSourcesRef.current = [];
     if (audioContextRef.current) {
@@ -153,7 +153,7 @@ function GeminiBot({ isActive, onTranscript }) {
               default:
                 break;
             }
-          } catch {}
+          } catch { }
         }
       };
 
@@ -182,9 +182,29 @@ function GeminiBot({ isActive, onTranscript }) {
         setTimeout(() => reject(new Error('WebSocket connection timeout')), 10000);
       });
 
-      // 4. Start mic capture
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
+      // 4. Start mic capture — reuse Agora track if available, else get new stream
+      let stream;
+      let ownsStream = false; // track whether we created the stream (so we know to stop it)
+
+      if (agoraAudioTrack) {
+        // Reuse the Agora SDK's underlying MediaStreamTrack to avoid mic conflicts
+        const rawTrack = agoraAudioTrack.getMediaStreamTrack
+          ? agoraAudioTrack.getMediaStreamTrack()
+          : null;
+        if (rawTrack) {
+          stream = new MediaStream([rawTrack]);
+          console.log('🤖 Reusing Agora mic track for Gemini bot');
+        }
+      }
+
+      if (!stream) {
+        // Fallback: request a new mic stream
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        ownsStream = true;
+        console.log('🤖 Using dedicated mic stream for Gemini bot');
+      }
+
+      mediaStreamRef.current = ownsStream ? stream : null; // only stop tracks we own
 
       const source = ctx.createMediaStreamSource(stream);
       const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
@@ -213,7 +233,7 @@ function GeminiBot({ isActive, onTranscript }) {
       setError(err.message);
       setStatus('error');
     }
-  }, [downsampleBuffer, convertFloat32ToInt16, playAudioChunk, stopAudioPlayback, onTranscript]);
+  }, [downsampleBuffer, convertFloat32ToInt16, playAudioChunk, stopAudioPlayback, onTranscript, agoraAudioTrack]);
 
   // ── Stop bot ─────────────────────────────────────────────
   const stopBot = useCallback(() => {
@@ -233,7 +253,7 @@ function GeminiBot({ isActive, onTranscript }) {
       wsRef.current = null;
     }
     if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current.close().catch(() => { });
       audioContextRef.current = null;
     }
 

@@ -1,0 +1,30 @@
+Task Management backend is ready. Project structure:
+
+```
+backend/
+â”œâ”€â”€ server.js
+â”œâ”€â”€ src/
+â”‚   â”œâ”€â”€ config/db.js
+â”‚   â”œâ”€â”€ models/Task.js
+â”‚   â”œâ”€â”€ controllers/taskController.js
+â”‚   â””â”€â”€ routes/taskRoutes.js
+â”œâ”€â”€ .env
+â”œâ”€â”€ .env.example
+â”œâ”€â”€ .gitignore
+â”œâ”€â”€ package.json
+â””â”€â”€ README.md
+```
+
+**API Endpoints:**
+- `GET /api/tasks` - List all tasks (query: `?status=Open&sortBy=dueDate&sortOrder=asc`)
+- `GET /api/tasks/:id` - Get single task
+- `POST /api/tasks` - Create task
+- `PUT /api/tasks/:id` - Update task
+- `DELETE /api/tasks/:id` - Delete task
+
+**To run:**
+```bash
+npm run dev
+```
+
+Ensure MongoDB is running locally on port 27017, or update `MONGODB_URI` in `.env`.

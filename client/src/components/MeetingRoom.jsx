@@ -5,6 +5,7 @@ import AgoraRTM from 'agora-rtm-sdk';
 import GeminiBot from './GeminiBot';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
+const ORCHESTRATOR_URL = 'http://localhost:8001';
 const APP_ID = import.meta.env.VITE_AGORA_APP_ID || '';
 
 // ── Agora RTC Client ────────────────────────────────────────
@@ -44,9 +45,21 @@ function MeetingRoom() {
   const [transcript, setTranscript] = useState('');
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isTranscriptOpen, setIsTranscriptOpen] = useState(true);
-  const recognitionRef = useRef(null);
+  const transcriptWsRef = useRef(null);
+  const transcriptCtxRef = useRef(null);
+  const transcriptWorkletRef = useRef(null);
+  const transcriptStreamRef = useRef(null);
   const transcriptRef = useRef('');
   const transcriptEndRef = useRef(null);
+
+  // Ingest / Review flow
+  const [isIngesting, setIsIngesting] = useState(false);
+  const [proposal, setProposal] = useState('');
+  const [isProposalDialogOpen, setIsProposalDialogOpen] = useState(false);
+  const [reviewFeedback, setReviewFeedback] = useState('');
+  const [isReviewing, setIsReviewing] = useState(false);
+  const [reviewResult, setReviewResult] = useState(null);
+  const [ingestError, setIngestError] = useState('');
 
   // Cumulative data refs
   const chatMessagesRef = useRef('');
@@ -152,8 +165,24 @@ function MeetingRoom() {
 
       // 4. Set up RTM for chat
       try {
+        // Fetch RTM token (required when dynamic keys are enabled)
+        let rtmToken = null;
+        try {
+          const rtmTokenRes = await fetch(`${SERVER_URL}/generate-rtm-token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uid: String(uidRef.current) }),
+          });
+          if (rtmTokenRes.ok) {
+            const rtmData = await rtmTokenRes.json();
+            rtmToken = rtmData.rtmToken;
+          }
+        } catch (err) {
+          console.warn('RTM token fetch failed, trying without token:', err.message);
+        }
+
         const rtm = AgoraRTM.createInstance(effectiveAppId);
-        await rtm.login({ uid: String(uidRef.current) });
+        await rtm.login({ uid: String(uidRef.current), token: rtmToken });
         const channel = rtm.createChannel(channelName);
         await channel.join();
 
@@ -218,10 +247,19 @@ function MeetingRoom() {
     };
   }, []);
 
-  // ── Play local video ───────────────────────────────────
+  // ── Play local video ────────────────────────────────────
+  const localVideoElRef = useRef(null);
+  const localVideoRef = useCallback((el) => {
+    localVideoElRef.current = el;
+    if (el && localVideoTrack && !isCameraOff) {
+      localVideoTrack.play(el);
+    }
+  }, [localVideoTrack, isCameraOff]);
+
+  // Re-play when camera is toggled back on (ref callback doesn't re-fire)
   useEffect(() => {
-    if (localVideoTrack && !isCameraOff) {
-      localVideoTrack.play('local-video');
+    if (localVideoElRef.current && localVideoTrack && !isCameraOff) {
+      localVideoTrack.play(localVideoElRef.current);
     }
   }, [localVideoTrack, isCameraOff]);
 
@@ -242,80 +280,177 @@ function MeetingRoom() {
     joinMeeting();
   }, [joinMeeting]);
 
-  // ── Speech Recognition ────────────────────────────────
-  const startTranscription = useCallback(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setConnectionError('Speech Recognition not supported in this browser. Use Chrome.');
-      return;
+  // ── Audio helpers for transcription ─────────────────────
+  const downsampleBuffer = useCallback((buffer, sampleRate, outSampleRate) => {
+    if (outSampleRate === sampleRate) return buffer;
+    const ratio = sampleRate / outSampleRate;
+    const newLength = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        accum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = accum / count;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
     }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognition.onresult = (event) => {
-      let interimTranscript = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          const finalText = result[0].transcript.trim();
-          if (finalText) {
-            const line = `Speaker (You): ${finalText}`;
-            transcriptRef.current += line + '\n';
-            setTranscript(transcriptRef.current);
-          }
-        } else {
-          interimTranscript += result[0].transcript;
-        }
-      }
-    };
-
-    recognition.onerror = (event) => {
-      console.warn('Speech recognition error:', event.error);
-      if (event.error === 'not-allowed') {
-        setConnectionError('Microphone access denied for transcription.');
-      }
-    };
-
-    recognition.onend = () => {
-      // Auto-restart if still transcribing
-      if (recognitionRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    recognition.start();
-    recognitionRef.current = recognition;
-    setIsTranscribing(true);
+    return result;
   }, []);
 
+  const convertFloat32ToInt16 = useCallback((buffer) => {
+    const buf = new Int16Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      buf[i] = Math.min(1, Math.max(-1, buffer[i])) * 0x7fff;
+    }
+    return buf.buffer;
+  }, []);
+
+  // ── Gemini-Powered Transcription ───────────────────────
+  const startTranscription = useCallback(async () => {
+    setIsTranscribing(true);
+    setConnectionError('');
+
+    try {
+      // 1. Set up AudioContext with worklet
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      transcriptCtxRef.current = ctx;
+      await ctx.audioWorklet.addModule('/pcm-processor.js');
+
+      // 2. Connect WebSocket to transcription endpoint
+      const wsProtocol = SERVER_URL.startsWith('https') ? 'wss' : 'ws';
+      const wsHost = SERVER_URL.replace(/^https?:\/\//, '');
+      const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/transcribe`);
+      ws.binaryType = 'arraybuffer';
+      transcriptWsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'transcript' && msg.text) {
+            const line = `Speaker: ${msg.text}`;
+            transcriptRef.current += line + '\n';
+            setTranscript(transcriptRef.current);
+          } else if (msg.type === 'error') {
+            console.error('Transcription error:', msg.text);
+            setConnectionError('Transcription error: ' + msg.text);
+          }
+        } catch { }
+      };
+
+      ws.onclose = () => {
+        console.log('Transcription WebSocket closed');
+      };
+
+      ws.onerror = () => {
+        setConnectionError('Failed to connect to transcription service');
+        setIsTranscribing(false);
+      };
+
+      // 3. Wait for WS to open
+      await new Promise((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('Transcription WebSocket failed'));
+        setTimeout(() => reject(new Error('Transcription connection timeout')), 10000);
+      });
+
+      // 4. Get audio stream — reuse Agora track or fallback to getUserMedia
+      let stream;
+      let ownsStream = false;
+
+      if (localAudioTrack) {
+        const rawTrack = localAudioTrack.getMediaStreamTrack
+          ? localAudioTrack.getMediaStreamTrack()
+          : null;
+        if (rawTrack) {
+          stream = new MediaStream([rawTrack]);
+          console.log('📝 Transcription: reusing Agora mic track');
+        }
+      }
+
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        ownsStream = true;
+        console.log('📝 Transcription: using dedicated mic stream');
+      }
+
+      transcriptStreamRef.current = ownsStream ? stream : null;
+
+      // 5. Connect AudioWorklet to capture + send PCM
+      const source = ctx.createMediaStreamSource(stream);
+      const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
+      transcriptWorkletRef.current = workletNode;
+
+      workletNode.port.onmessage = (event) => {
+        if (transcriptWsRef.current?.readyState === WebSocket.OPEN) {
+          const downsampled = downsampleBuffer(event.data, ctx.sampleRate, 16000);
+          const pcm16 = convertFloat32ToInt16(downsampled);
+          transcriptWsRef.current.send(pcm16);
+        }
+      };
+
+      source.connect(workletNode);
+      const muteGain = ctx.createGain();
+      muteGain.gain.value = 0;
+      workletNode.connect(muteGain);
+      muteGain.connect(ctx.destination);
+
+      console.log('📝 Transcription started');
+    } catch (err) {
+      console.error('Transcription start failed:', err);
+      setConnectionError('Failed to start transcription: ' + err.message);
+      setIsTranscribing(false);
+    }
+  }, [localAudioTrack, downsampleBuffer, convertFloat32ToInt16]);
+
   const stopTranscription = useCallback(() => {
-    if (recognitionRef.current) {
-      recognitionRef.current.onend = null;
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
+    if (transcriptWorkletRef.current) {
+      transcriptWorkletRef.current.disconnect();
+      transcriptWorkletRef.current = null;
+    }
+    if (transcriptStreamRef.current) {
+      transcriptStreamRef.current.getTracks().forEach((t) => t.stop());
+      transcriptStreamRef.current = null;
+    }
+    if (transcriptWsRef.current) {
+      transcriptWsRef.current.close();
+      transcriptWsRef.current = null;
+    }
+    if (transcriptCtxRef.current) {
+      transcriptCtxRef.current.close().catch(() => { });
+      transcriptCtxRef.current = null;
     }
     setIsTranscribing(false);
   }, []);
 
   // ── Toggle controls ───────────────────────────────────
   const toggleMute = async () => {
-    if (localAudioTrack) {
-      await localAudioTrack.setEnabled(isMuted);
+    if (!localAudioTrack) {
+      console.warn('toggleMute: no localAudioTrack available');
+      setConnectionError('No microphone track available. Check mic permissions.');
+      return;
+    }
+    try {
+      // setMuted(true) = mute, setMuted(false) = unmute
+      await localAudioTrack.setMuted(!isMuted);
       setIsMuted(!isMuted);
+    } catch (err) {
+      console.error('toggleMute failed:', err);
+      setConnectionError('Failed to toggle mute: ' + err.message);
     }
   };
 
   const toggleCamera = async () => {
-    if (localVideoTrack) {
-      await localVideoTrack.setEnabled(isCameraOff);
+    if (!localVideoTrack) return;
+    try {
+      await localVideoTrack.setMuted(!isCameraOff);
       setIsCameraOff(!isCameraOff);
+    } catch (err) {
+      console.error('toggleCamera failed:', err);
     }
   };
 
@@ -332,6 +467,59 @@ function MeetingRoom() {
       setChatInput('');
     } catch (err) {
       console.error('Failed to send message:', err);
+    }
+  };
+
+  // ── Generate Proposal (Ingest) ────────────────────────
+  const handleGenerateProposal = async () => {
+    setIsIngesting(true);
+    setIngestError('');
+    try {
+      const res = await fetch(`${ORCHESTRATOR_URL}/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectName: project.name || channelName,
+          transcription: transcriptRef.current,
+          chats: chatMessagesRef.current,
+          isnew: true,
+        }),
+      });
+      if (!res.ok) throw new Error(`Ingest failed (${res.status})`);
+      const data = await res.json();
+      setProposal(data.proposal || 'No proposal returned.');
+      setIsProposalDialogOpen(true);
+      setReviewResult(null);
+      setReviewFeedback('');
+    } catch (err) {
+      console.error('Ingest error:', err);
+      setIngestError(err.message || 'Failed to generate proposal');
+    } finally {
+      setIsIngesting(false);
+    }
+  };
+
+  // ── Submit Review ─────────────────────────────────────
+  const handleSubmitReview = async () => {
+    setIsReviewing(true);
+    setIngestError('');
+    try {
+      const res = await fetch(`${ORCHESTRATOR_URL}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectName: project.name || channelName,
+          reviewFeedback: reviewFeedback.trim() || 'no changes proceed',
+        }),
+      });
+      if (!res.ok) throw new Error(`Review failed (${res.status})`);
+      const data = await res.json();
+      setReviewResult(data);
+    } catch (err) {
+      console.error('Review error:', err);
+      setIngestError(err.message || 'Failed to submit review');
+    } finally {
+      setIsReviewing(false);
     }
   };
 
@@ -392,11 +580,11 @@ function MeetingRoom() {
       // Only leave if not mid-join (let joinMeeting handle its own cleanup)
       if (!joiningRef.current) {
         if (rtcClient.connectionState === 'CONNECTED' || rtcClient.connectionState === 'CONNECTING') {
-          rtcClient.leave().catch(() => {});
+          rtcClient.leave().catch(() => { });
         }
       }
-      rtmChannel?.leave().catch(() => {});
-      rtmClient?.logout().catch(() => {});
+      rtmChannel?.leave().catch(() => { });
+      rtmClient?.logout().catch(() => { });
     };
   }, [localAudioTrack, localVideoTrack, rtmChannel, rtmClient, stopTranscription]);
 
@@ -462,6 +650,33 @@ function MeetingRoom() {
             )}
             <div ref={transcriptEndRef} />
           </div>
+          <div className="transcript-panel-footer">
+            <button
+              className="generate-proposal-btn"
+              onClick={handleGenerateProposal}
+              disabled={isIngesting}
+              title="Send transcript & chats to AI Orchestrator"
+            >
+              {isIngesting ? (
+                <>
+                  <span className="btn-spinner" />
+                  Generating…
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                    <path d="M2 17l10 5 10-5" />
+                    <path d="M2 12l10 5 10-5" />
+                  </svg>
+                  Generate Proposal
+                </>
+              )}
+            </button>
+            {ingestError && !isProposalDialogOpen && (
+              <div className="ingest-error">{ingestError}</div>
+            )}
+          </div>
         </aside>
       )}
 
@@ -505,7 +720,7 @@ function MeetingRoom() {
         <div className={`video-grid video-grid--${gridClass}`}>
           {/* Local video */}
           <div className="video-tile video-tile--local">
-            <div id="local-video" className="video-player" />
+            <div ref={localVideoRef} className="video-player" />
             {isCameraOff && (
               <div className="video-placeholder">
                 <div className="video-avatar">You</div>
@@ -645,8 +860,116 @@ function MeetingRoom() {
       )}
 
       {/* ── AI Bot Panel ── */}
+      {/* ── Proposal Dialog ── */}
+      {isProposalDialogOpen && (
+        <div className="proposal-dialog-overlay" onClick={() => !isReviewing && setIsProposalDialogOpen(false)}>
+          <div className="proposal-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="proposal-dialog-header">
+              <h2>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="22" height="22">
+                  <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                  <path d="M2 17l10 5 10-5" />
+                  <path d="M2 12l10 5 10-5" />
+                </svg>
+                Generated Proposal
+              </h2>
+              <button
+                className="panel-close-btn"
+                onClick={() => setIsProposalDialogOpen(false)}
+                disabled={isReviewing}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="proposal-dialog-body">
+              {reviewResult ? (
+                <div className="review-success">
+                  <div className="review-success-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="48" height="48">
+                      <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
+                      <polyline points="22 4 12 14.01 9 11.01" />
+                    </svg>
+                  </div>
+                  <h3>Project Generated Successfully!</h3>
+                  <p className="review-success-status">{reviewResult.status}</p>
+                  {reviewResult.project_path && (
+                    <div className="review-success-path">
+                      <span>Project Path:</span>
+                      <code>{reviewResult.absolute_path || reviewResult.project_path}</code>
+                    </div>
+                  )}
+                  <button
+                    className="review-done-btn"
+                    onClick={() => setIsProposalDialogOpen(false)}
+                  >
+                    Done
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="proposal-content">
+                    <pre>{proposal}</pre>
+                  </div>
+
+                  <div className="review-section">
+                    <label className="review-label">Review Feedback</label>
+                    <textarea
+                      className="review-textarea"
+                      placeholder="Enter your feedback, or leave empty to proceed without changes…"
+                      value={reviewFeedback}
+                      onChange={(e) => setReviewFeedback(e.target.value)}
+                      rows={4}
+                      disabled={isReviewing}
+                    />
+                    {ingestError && (
+                      <div className="ingest-error">{ingestError}</div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {!reviewResult && (
+              <div className="proposal-dialog-footer">
+                <button
+                  className="review-cancel-btn"
+                  onClick={() => setIsProposalDialogOpen(false)}
+                  disabled={isReviewing}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="review-submit-btn"
+                  onClick={handleSubmitReview}
+                  disabled={isReviewing}
+                >
+                  {isReviewing ? (
+                    <>
+                      <span className="btn-spinner" />
+                      Submitting…
+                    </>
+                  ) : (
+                    <>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                        <line x1="22" y1="2" x2="11" y2="13" />
+                        <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                      </svg>
+                      Submit Review
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <GeminiBot
         isActive={isBotActive}
+        agoraAudioTrack={localAudioTrack}
         onTranscript={(line) => {
           transcriptRef.current += line + '\n';
           setTranscript(transcriptRef.current);

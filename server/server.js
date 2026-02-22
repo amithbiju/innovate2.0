@@ -5,6 +5,7 @@ const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 const { GoogleGenAI, Modality } = require("@google/genai");
 const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
+const { RtmTokenBuilder, RtmRole } = require("agora-access-token");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -68,6 +69,44 @@ app.post("/generate-token", (req, res) => {
   }
 });
 
+// ── 1b. Generate RTM Token ──────────────────────────────────
+app.post("/generate-rtm-token", (req, res) => {
+  try {
+    const { uid } = req.body;
+
+    if (!uid) {
+      return res.status(400).json({ error: "uid is required" });
+    }
+
+    const appId = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+
+    if (!appId || !appCertificate) {
+      return res.status(500).json({
+        error: "Agora credentials not configured",
+      });
+    }
+
+    const expirationTimeInSeconds = 3600;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    const rtmToken = RtmTokenBuilder.buildToken(
+      appId,
+      appCertificate,
+      String(uid),
+      RtmRole.Rtm_User,
+      privilegeExpiredTs
+    );
+
+    console.log(`✅ RTM Token generated for uid: ${uid}`);
+    return res.json({ rtmToken });
+  } catch (err) {
+    console.error("❌ RTM Token generation failed:", err.message);
+    return res.status(500).json({ error: "RTM Token generation failed", details: err.message });
+  }
+});
+
 // ── 2. Receive Meeting Data ─────────────────────────────────
 app.post("/api/meeting-capture", (req, res) => {
   try {
@@ -120,10 +159,118 @@ app.use((err, _req, res, _next) => {
 
 // ── Create HTTP + WebSocket server ──────────────────────────
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws/gemini" });
+const wssGemini = new WebSocketServer({ noServer: true });
+const wssTranscribe = new WebSocketServer({ noServer: true });
 
-// ── 4. Gemini Live API WebSocket Proxy ──────────────────────
-wss.on("connection", async (clientWs) => {
+// Route WebSocket connections by path
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+  if (pathname === "/ws/gemini") {
+    wssGemini.handleUpgrade(request, socket, head, (ws) => {
+      wssGemini.emit("connection", ws, request);
+    });
+  } else if (pathname === "/ws/transcribe") {
+    wssTranscribe.handleUpgrade(request, socket, head, (ws) => {
+      wssTranscribe.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// ── 4a. Transcription-Only WebSocket ────────────────────────
+wssTranscribe.on("connection", async (clientWs) => {
+  console.log("\n📝 Transcription WebSocket connected");
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    clientWs.send(JSON.stringify({ type: "error", text: "GEMINI_API_KEY not configured" }));
+    clientWs.close();
+    return;
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
+  let session = null;
+  let alive = true;
+
+  try {
+    session = await ai.live.connect({
+      model: "gemini-2.0-flash-live-001",
+      config: {
+        responseModalities: [Modality.TEXT],
+        inputAudioTranscription: {},
+        systemInstruction: {
+          parts: [{
+            text: "You are a silent transcription assistant. Do NOT respond to anything the user says. Your only job is to listen. Do not generate any text responses.",
+          }],
+        },
+      },
+      callbacks: {
+        onopen: () => {
+          console.log("📝 Gemini transcription session established");
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "connected" }));
+          }
+        },
+        onmessage: (message) => {
+          if (!alive || clientWs.readyState !== WebSocket.OPEN) return;
+
+          const sc = message.serverContent;
+          if (sc && sc.inputTranscription && sc.inputTranscription.text) {
+            console.log(`📝 Transcript: "${sc.inputTranscription.text}"`);
+            clientWs.send(JSON.stringify({
+              type: "transcript",
+              text: sc.inputTranscription.text,
+            }));
+          }
+        },
+        onerror: (e) => {
+          console.error("📝 Transcription session error:", e.message || e);
+          if (alive && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "error", text: String(e.message || e) }));
+          }
+        },
+        onclose: () => {
+          console.log("📝 Transcription session closed");
+          alive = false;
+        },
+      },
+    });
+
+    clientWs.on("message", (data, isBinary) => {
+      if (!session || !alive) return;
+      if (isBinary) {
+        session.sendRealtimeInput({
+          audio: {
+            data: Buffer.from(data).toString("base64"),
+            mimeType: "audio/pcm;rate=16000",
+          },
+        });
+      }
+    });
+
+    clientWs.on("close", () => {
+      console.log("📝 Transcription client disconnected");
+      alive = false;
+      if (session) { session.close(); session = null; }
+    });
+
+    clientWs.on("error", (err) => {
+      console.error("📝 Transcription client error:", err.message);
+      alive = false;
+    });
+
+  } catch (err) {
+    console.error("📝 Transcription session creation failed:", err.message);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: "error", text: `Session failed: ${err.message}` }));
+      clientWs.close();
+    }
+  }
+});
+
+// ── 4b. Gemini Live API WebSocket Proxy ─────────────────────
+wssGemini.on("connection", async (clientWs) => {
   console.log("\n🤖 Gemini bot WebSocket connected");
 
   const apiKey = process.env.GEMINI_API_KEY;
@@ -143,6 +290,8 @@ wss.on("connection", async (clientWs) => {
       model: "gemini-2.0-flash-live-001",
       config: {
         responseModalities: [Modality.AUDIO],
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },
